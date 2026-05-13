@@ -3029,7 +3029,7 @@ const activeLockWindow = Behaviors.select(
 );
 
 // On moveDown / windowResizeDown / docSeparator, claim the appropriate locks.
-const _lockClaim = ((ev, viewId) => {
+const _lockClaim = ((ev, viewId, interactionStatus) => {
   const cornerLocks = {
     topLeft: ["top","left"], topRight: ["top","right"],
     bottomLeft: ["bottom","left"], bottomRight: ["bottom","right"]
@@ -3044,8 +3044,23 @@ const _lockClaim = ((ev, viewId) => {
   } else {
     return;
   }
+  // Pre-flight against the view's local interactionStatus: if every
+  // requested lock is already held by another view, the model would
+  // deny the request anyway, so skip sending it. Partial grants still
+  // pass through — e.g. a full move where two edges are taken proceeds
+  // to the model, which grants the remaining two.
+  const windowMap = interactionStatus.map.get(ev.id);
+  if (windowMap) {
+    const conflicting = new Set();
+    for (const [otherId, otherState] of windowMap) {
+      if (otherId !== viewId) {
+        for (const lk of otherState.heldLocks) conflicting.add(lk);
+      }
+    }
+    if (requestedLocks.every((l) => conflicting.has(l))) return;
+  }
   Events.send(interactionLockRequest, {windowId: ev.id, viewId, requestedLocks});
-})(padDown, viewId);
+})(padDown, viewId, interactionStatus);
 
 // (Lock auto-refresh happens model-side: each successful moveOrResize that
 // passes the gate updates lockTime via the moveOrResize trigger on
