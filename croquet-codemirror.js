@@ -343,7 +343,16 @@ const sharedSelectionExtender = EditorState.transactionExtender.of((tr) => {
 });
 
 function mapSelectionRange(range, changes) {
-  const forward = range.anchor <= range.head;
+  // Collapsed range (a cursor): map both ends with the same associativity
+  // so it stays collapsed. Mapping the two ends with opposite biases — as
+  // the selection case below does to keep insertions from being swallowed
+  // — would stretch a cursor sitting exactly at an insertion point into a
+  // full selection spanning the inserted text.
+  if (range.anchor === range.head) {
+    const pos = changes.mapPos(range.anchor, -1);
+    return {anchor: pos, head: pos};
+  }
+  const forward = range.anchor < range.head;
   const anchor = changes.mapPos(range.anchor, forward ? 1 : -1);
   const head = changes.mapPos(range.head, forward ? -1 : 1);
   return {anchor, head};
