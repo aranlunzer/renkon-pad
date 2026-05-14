@@ -1475,7 +1475,8 @@ const newEditor = (id, docModel) => {
       "windows", "windowTypes", "positions", "titles", "windowEnabled",
       "zIndex", "windowContentsModel", "padTitle", "docSeparators", "initialData",
       "newId", "padViews", "padExtent", "cursorPositions", "newWindowRequest", "padTitle", "viewJoin",
-      "viewExit", "xxx", "loadReceiver", "loadHandler", "loadFromFile", "loadFromProgram", "runRequest", "resetRequest",
+      "viewExit", "xxx", "chunkedSendBuffers", "chunkedSendTimer", "chunkedCompletion",
+      "loadHandler", "loadFromFile", "loadFromProgram", "runRequest", "resetRequest",
       "interactionStatus", "interactionLockTimer", "gatedMoveOrResize", "gatedSeparatorMove"]},
     persistentNodes: [["windows", 60000]],
     name: "pad"
@@ -2429,32 +2430,49 @@ const loader = (() => {
   imageInput.click();
 })(load);
 
-const loadData = async (data, maybeImageInput) => {
-  const array = new TextEncoder().encode(data);
-  if (isLocal) {
-    Events.send(loadAtOnce, {key: 1, array: [array], done: true});
-    return;
-  }
-      
+// === Chunked-send helpers (sender side of the chunked-send primitive) ===
+// chunkedSend is a view-defined receiver; the model picks the chunks up
+// through the standard viewToModel bridge. Use chunkedSendString for text
+// (UTF-8 encoded internally) or chunkedSendBytes for raw bytes. See the
+// chunkedSendBuffers node for the matching model-side assembler.
+
+const chunkedSend = Events.receiver({queued: true});
+
+const chunkedSendString = async ({kind, target, metadata, text}) => {
+  return chunkedSendBytes({kind, target, metadata, bytes: new TextEncoder().encode(text)});
+};
+
+const chunkedSendBytes = async ({kind, target, metadata, bytes}) => {
+  // chunk size chosen to fit in Croquet's recommended 4KB max message
+  // size after serialisation plus envelope overhead
+  const CHUNK_SIZE = 2500;
+  const sendKey = \`\${viewId}-\${Date.now()}-\${Math.random().toString(36).slice(2)}\`;
+  const totalChunks = Math.max(1, Math.ceil(bytes.length / CHUNK_SIZE));
+  // chunkedSend is a queued receiver: multiple Events.send calls in the
+  // same evaluation cycle accumulate into one array, which the announcer
+  // would then publish as one giant viewMessage. We must yield between
+  // sends so each chunk gets its own evaluator cycle (and its own publish).
+  // Local mode has no reflector and doesn't care.
+  const throttle = !isLocal && totalChunks > 1;
   let ind = 0;
-  const key = Math.random();
-
-  Events.send(loadEvent, {key, type: "loadStart"});
-  const throttle = array.length > 80000;
-
-  while (ind < array.length) {
-    let buf = array.slice(ind, ind + 2880);
-    Events.send(loadEvent, {key, type: "loadOne", array: buf});
-    ind += 2880;
-    if (throttle) {
-      await new Promise((resolve) => {
-        setTimeout(resolve, 34);
-      });
-    }
+  let isFirst = true;
+  while (true) {
+    const isLast = ind + CHUNK_SIZE >= bytes.length;
+    const buf = bytes.slice(ind, ind + CHUNK_SIZE);
+    const payload = {viewId, sendKey, isFirst, isLast, buf};
+    if (isFirst) Object.assign(payload, {kind, target, metadata});
+    Events.send(chunkedSend, payload);
+    ind += CHUNK_SIZE;
+    isFirst = false;
+    if (isLast) break;
+    if (throttle) await new Promise((resolve) => setTimeout(resolve, 17));
   }
+};
+
+const loadData = async (data, maybeImageInput) => {
+  await chunkedSendString({kind: "padLoad", text: data});
   if (maybeImageInput) maybeImageInput.remove();
-  Events.send(loadEvent, {key, type: "loadDone"});
-}
+};
 
 const nameFromUrl = (() => {
   const maybeUrl = new URL(window.location).searchParams.get("file");
@@ -3440,48 +3458,71 @@ const _goTo = ((padView, positions, dblClick, viewId) => {
   return {dom: runnerIframe};
 };
 `],
-[`88`, `const loadAtOnce = Events.receiver();
-const loadEvent = Events.receiver({queued: true});
+[`88`, `// === Generic chunked-send primitive ===
+// View code sends a payload in 2500-byte chunks via the \`chunkedSend\` event.
+// Each chunk carries the same \`sendKey\` so multiple sends can interleave
+// freely; the first chunk (isFirst=true) carries {kind, target, metadata},
+// and the last chunk (isLast=true) triggers assembly. The reassembled bytes
+// are dispatched on \`chunkedCompletion\`, where domain consumers filter by
+// \`kind\` and apply their own conflict resolution.
 
-const loadReceiver = Behaviors.select(
-  undefined, // {key:number, array}
-  loadEvent, (prev, events) => {
-    let result = prev;
-    for (const event of events) {
-      if (event.type === "loadStart") {
-        result = {key: event.key, array: []};
-      } else if (event.type === "loadOne") {
-        if (result?.key !== event.key) {
-          result = undefined;
-          break;
-        }
-        result = {key: result.key, array: [...result.array, event.array]}
-      } else if (event.type === "loadDone") {
-        if (result?.key !== event.key ) {
-          result = undefined;
-          break;
-        }
-        result = {key: result.key, array: result.array, done: true}
+const chunkedCompletion = Events.receiver({queued: true});
+const chunkedSendTimer = Events.timer(5000);
+
+const chunkedSendBuffers = Behaviors.select(
+  {sends: new Map()},  // sendKey -> {viewId, kind, target, metadata, chunks, lastTime}
+  chunkedSend, (prev, events) => {
+    for (const ev of events) {
+      if (ev.isFirst) {
+        prev.sends.set(ev.sendKey, {
+          viewId: ev.viewId, kind: ev.kind, target: ev.target,
+          metadata: ev.metadata, chunks: [], lastTime: Renkon.time
+        });
+      }
+      const entry = prev.sends.get(ev.sendKey);
+      if (!entry) continue; // chunk for a send we don't know about (stale)
+      entry.chunks.push(ev.buf);
+      entry.lastTime = Renkon.time;
+      if (ev.isLast) {
+        const len = entry.chunks.reduce((a, b) => a + b.length, 0);
+        const bytes = new Uint8Array(len);
+        let ind = 0;
+        for (const b of entry.chunks) { bytes.set(b, ind); ind += b.length; }
+        Events.send(chunkedCompletion, {
+          viewId: entry.viewId, kind: entry.kind, target: entry.target,
+          metadata: entry.metadata, bytes
+        });
+        prev.sends.delete(ev.sendKey);
       }
     }
-    return result;
+    return {sends: prev.sends};
   },
-  loadAtOnce, (_prev, value) => {
-    return value;
+  viewExit, (prev, viewIds) => {
+    // sender disconnected — drop any of their in-flight sends
+    for (const vid of viewIds) {
+      for (const [sendKey, entry] of prev.sends) {
+        if (entry.viewId === vid) prev.sends.delete(sendKey);
+      }
+    }
+    return {sends: prev.sends};
+  },
+  chunkedSendTimer, (prev, _) => {
+    // GC entries that have been idle longer than 30s — covers crash/network
+    // drops where viewExit may not arrive in time.
+    const STALE_MS = 30000;
+    const now = Renkon.time;
+    for (const [sendKey, entry] of prev.sends) {
+      if (now - entry.lastTime > STALE_MS) prev.sends.delete(sendKey);
+    }
+    return {sends: prev.sends};
   }
 );
 
-const loadFromFile = ((loadReceiver) => {
-  if (!loadReceiver?.done) {return;}
-
-  const array = loadReceiver.array;
-  let len = array.reduce((acc, cur) => acc + cur.length, 0);
-  let all = new Uint8Array(len);
-  let ind = 0;
-  for (let i = 0; i < array.length; i++) {
-    all.set(array[i], ind);
-    ind += array[i].length;
-  }
+// Pad-load consumer: assembles a "padLoad"-kind completion into the
+// previously-loadFromFile shape.
+const loadFromFile = ((completions) => {
+  const c = completions.findLast((c) => c.kind === "padLoad");
+  if (!c) return undefined;
 
   const parse = (string) => {
     return JSON.parse(string, (_key, value) => {
@@ -3492,30 +3533,26 @@ const loadFromFile = ((loadReceiver) => {
       }
       return value;
     });
-  }
+  };
 
   const parseCodeMap = (string) => {
     const array = eval("(" + string + ")");
     return new Map(array.value);
-  }
+  };
 
-  let result = new TextDecoder("utf-8").decode(all);
-
+  const result = new TextDecoder("utf-8").decode(c.bytes);
   const index = result.indexOf("{__codeMap: true, value:");
-
   const data1 = result.slice(0, index);
   const data2 = result.slice(index);
-
   const loaded = parse(data1);
 
   if (loaded.version === 2 || loaded.version === 3) {
-    const code = parseCodeMap(data2);
-    loaded.code = code;
+    loaded.code = parseCodeMap(data2);
     return loaded;
   }
   console.log("unknown type of data");
-  return;
-})(Events.change(loadReceiver));
+  return undefined;
+})(chunkedCompletion);
 
 const loadHandler = Events.or(loadFromFile, loadFromProgram);
 const loadFromProgram = Events.receiver();`],
