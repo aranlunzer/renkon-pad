@@ -1773,6 +1773,13 @@ const windowContents = Behaviors.select(
   detachReceiver, (prev, _detach) => ({map: new Map()}),
   windowContentsModel, (prev, windowContentsModel) => {
     if (windowContentsModel.loaded) {
+      // Tear down stale editors before clearing the map. Without this their
+      // CodeMirror plugins (HoverPlugin etc.) keep pending timeouts that
+      // later fire against a now-detached view, throwing RangeErrors.
+      for (const [, c] of prev.map) {
+        if (c?.destroy) c.destroy();
+        else if (c?.editor?.destroy) c.editor.destroy();
+      }
       prev.map.clear();
     }
 
@@ -1780,7 +1787,13 @@ const windowContents = Behaviors.select(
     const newKeys = [...windowContentsModel.map.keys()];
     const olds = prevKeys.filter((e) => !newKeys.includes(e));
     const news = newKeys.filter((e) => !prevKeys.includes(e));
-    olds.forEach((id) => prev.map.delete(\`\${id}\`));
+    olds.forEach((id) => {
+      // Same teardown as on load — release CodeMirror plugin timeouts etc.
+      const c = prev.map.get(\`\${id}\`);
+      if (c?.destroy) c.destroy();
+      else if (c?.editor?.destroy) c.editor.destroy();
+      prev.map.delete(\`\${id}\`);
+    });
     news.forEach((id) => {
       const {type, doc} = windowContentsModel.map.get(id);
       let elem;
@@ -1873,6 +1886,10 @@ class DependencyPlugin {
 
   checkHover() {
     this.hoverTimeout = -1;
+    // Bail if the EditorView's DOM has been detached (e.g. the window was
+    // deleted or replaced by a load before this scheduled timer ran).
+    // Without this guard, posAtCoords inside startHover throws RangeError.
+    if (!this.view.dom?.isConnected) return;
     if (this.tooltip) return;
     let hovered = Date.now() - this.lastMove.time;
     if (hovered < this.hoverTime) {
